@@ -1,6 +1,8 @@
 import os, imaplib, base64, socket, sys, time, re
 import html
 import logging
+import urllib.request
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from email import message_from_bytes
 from email.mime.text import MIMEText
@@ -18,14 +20,17 @@ imaplib._MAXLINE = 10 * 1024 * 1024
 
 TIMEOUT = 60
 COMMON_CREDENTIALS = "client_secret.json"
-TO_GMAIL_VERSION="v1.2"
+TO_GMAIL_VERSION="v1.3"
+
+# [v1.3 업데이트 내역]
+# 1. 자동 업데이트 기능 추가 (GitHub 원격 버전 체크 및 자가 파일 교체)
+# 2. 매일 새벽 4시 정기 종료 로직 추가 (Cron에 의한 재기동 및 자동 업데이트 유도)
 
 # [v1.2 업데이트 내역]
-# 1. 세션 재접속 시간을 4분에서 3분으로 단축
-# 2. 메일 제목의 HTML 엔티티(&#40; 등) 디코딩 처리 추가
+# 1. 메일 제목의 HTML 엔티티(&#40; 등) 디코딩 처리 추가
+
 # [v1.1 업데이트 내역]
-# 1. 세션 재접속 시간을 8분에서 4분으로 단축
-# 2. 지메일 처리 완료 후 휴지통 이동/읽음 처리하도록 로직 순서 개선 (에러 발생 시 크론에 의한 정상 재기동 목적)
+# 1. 지메일 처리 완료 후 휴지통 이동/읽음 처리하도록 로직 순서 개선 (에러 발생 시 크론에 의한 정상 재기동 목적)
 
 socket.setdefaulttimeout(TIMEOUT)
 
@@ -49,6 +54,35 @@ else:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 # ==========================================
+
+def check_and_update():
+    """GitHub에서 최신 버전을 확인하고, 버전이 다르면 다운로드 및 교체 후 종료합니다."""
+    update_url = "https://raw.githubusercontent.com/gomclass/toGmail/refs/heads/main/toGmail.py"
+    try:
+        req = urllib.request.Request(update_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            content = response.read().decode('utf-8')
+        
+        # 정규식으로 TO_GMAIL_VERSION 추출
+        match = re.search(r'TO_GMAIL_VERSION\s*=\s*["\']([^"\']+)["\']', content)
+        if match:
+            remote_version = match.group(1)
+            if remote_version != TO_GMAIL_VERSION:
+                logger.info(f"새 버전({remote_version})을 발견했습니다. (현재: {TO_GMAIL_VERSION}) 업데이트를 진행합니다.")
+                
+                # 문법 검사 (오류 발생 시 예외 발생하여 덮어쓰기 방지)
+                compile(content, '<string>', 'exec')
+                
+                current_file = os.path.abspath(__file__)
+                temp_file = current_file + ".tmp"
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                os.replace(temp_file, current_file) # 원본 덮어쓰기 (원자적 교체)
+                
+                logger.info("업데이트 파일 교체가 완료되었습니다. 적용을 위해 프로그램을 종료(재시작)합니다.")
+                sys.exit(0)
+    except Exception as e:
+        logger.error(f"업데이트 확인 중 오류 발생 (진행 무시): {e}")
 
 def get_gmail_service(token_filename):
     creds = None
@@ -265,8 +299,12 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
             raise # main()의 except 블록으로 예외를 전달
 
 def main():
+    check_and_update()
     logger.info(f"toGmail {TO_GMAIL_VERSION} 시작(순차/Polling 모드).")
     
+    # 4시 무한 재시작 방지를 위해, 스크립트가 기동된 날짜를 기록
+    last_checked_day = datetime.now().day
+
     while True:
         connections = []
         session_start_time = time.time()
@@ -312,6 +350,12 @@ def main():
         while True:
             current_time = time.time()
             
+            # 하루 1번, 새벽 4시가 되면 정기 업데이트 체크를 위해 프로그램 종료
+            now = datetime.now()
+            if now.hour == 4 and now.day != last_checked_day:
+                logger.info("새벽 4시 정기 재시작(업데이트 체크용)을 위해 프로그램을 종료합니다.")
+                sys.exit(0)
+
             # 3분(180초)이 경과했으면 안전하게 연결을 종료하고 재접속 (run_once 모드가 아닐 때)
             if not run_once and (current_time - session_start_time) >= 180:
                 logger.info("세션 유지 시간(3분) 경과. 재접속합니다.")
