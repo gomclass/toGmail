@@ -299,7 +299,8 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
             raise # main()의 except 블록으로 예외를 전달
 
 def main():
-    check_and_update()
+    if not run_once:
+        check_and_update()
     logger.info(f"toGmail {TO_GMAIL_VERSION} 시작(순차/Polling 모드).")
     
     # 4시 무한 재시작 방지를 위해, 스크립트가 기동된 날짜를 기록
