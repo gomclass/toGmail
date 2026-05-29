@@ -68,7 +68,7 @@ def check_and_update():
         if match:
             remote_version = match.group(1)
             if remote_version != TO_GMAIL_VERSION:
-                logger.info(f"새 버전({remote_version})을 발견했습니다. (현재: {TO_GMAIL_VERSION}) 업데이트를 진행합니다.")
+                logger.info(f"새 버전({remote_version})을 발견했습니다. (현재: {TO_GMAIL_VERSION})업데이트를 진행합니다.")
                 
                 # 문법 검사 (오류 발생 시 예외 발생하여 덮어쓰기 방지)
                 compile(content, '<string>', 'exec')
