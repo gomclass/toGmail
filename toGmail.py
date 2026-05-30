@@ -1,7 +1,5 @@
-import os, imaplib, base64, socket, sys, time, re
-import html
-import logging
-import urllib.request
+import os, imaplib, base64, socket, sys, time, re, html, logging, urllib.request
+imaplib._MAXLINE = 10 * 1024 * 1024 # 기본값 2048을 10MB로 상향 (긴 줄이 포함된 메일 처리용)
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from email import message_from_bytes
@@ -15,13 +13,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from config import ACCOUNTS_CONFIG
 
-# 기본값 2048을 10MB로 상향 (긴 줄이 포함된 메일 처리용)
-imaplib._MAXLINE = 10 * 1024 * 1024
-
-TIMEOUT = 60
-COMMON_CREDENTIALS = "client_secret.json"
-TO_GMAIL_VERSION="v1.3"
-
 # [v1.3 업데이트 내역]
 # 1. 자동 업데이트 기능 추가 (GitHub 원격 버전 체크 및 자가 파일 교체)
 # 2. 매일 새벽 4시 정기 종료 로직 추가 (Cron에 의한 재기동 및 자동 업데이트 유도)
@@ -34,6 +25,9 @@ TO_GMAIL_VERSION="v1.3"
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
+TO_GMAIL_VERSION="v1.3"
+COMMON_CREDENTIALS = "client_secret.json"
+TIMEOUT = 60
 socket.setdefaulttimeout(TIMEOUT)
 
 # ==========================================
