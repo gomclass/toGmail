@@ -307,6 +307,13 @@ def main():
     last_checked_day = datetime.now().day
 
     while True:
+        # 하루 1번, 새벽 4시가 되면 정기 업데이트 체크를 위해 프로그램 종료
+        # (세션 재연결 주기인 3분마다 한 번씩만 체크하여 자연스러운 분산 종료 효과 발생)
+        now = datetime.now()
+        if now.hour == 4 and now.day != last_checked_day:
+            logger.info("새벽 4시 정기 재시작(업데이트 체크용)을 위해 프로그램을 종료합니다.")
+            sys.exit(0)
+
         connections = []
         session_start_time = time.time()
         
@@ -351,12 +358,6 @@ def main():
         while True:
             current_time = time.time()
             
-            # 하루 1번, 새벽 4시가 되면 정기 업데이트 체크를 위해 프로그램 종료
-            now = datetime.now()
-            if now.hour == 4 and now.day != last_checked_day:
-                logger.info("새벽 4시 정기 재시작(업데이트 체크용)을 위해 프로그램을 종료합니다.")
-                sys.exit(0)
-
             # 3분(180초)이 경과했으면 안전하게 연결을 종료하고 재접속 (run_once 모드가 아닐 때)
             if not run_once and (current_time - session_start_time) >= 180:
                 logger.info("세션 유지 시간(3분) 경과. 재접속합니다.")
