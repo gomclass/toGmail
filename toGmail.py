@@ -197,7 +197,7 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
     if status != 'OK' or not messages[0]:
         return
         
-    msg_uids = messages[0].split()[:5]
+    msg_uids = messages[0].split()[:3]
     
     for uid_bytes in msg_uids:
         uid = uid_bytes.decode()
