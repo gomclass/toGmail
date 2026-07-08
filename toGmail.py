@@ -12,6 +12,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from config import ACCOUNTS_CONFIG
+try:
+    from config import AUTO_UPDATE
+except ImportError:
+    AUTO_UPDATE = 'no'
 
 # [v1.3 업데이트 내역]
 # 1. 자동 업데이트 기능 추가 (GitHub 원격 버전 체크 및 자가 파일 교체)
@@ -105,10 +109,26 @@ def decode_mime_header(text):
     if not text: return "Unknown"
     text_str = str(text)
     decoded = []
+    
+    # 스팸 메일 등에서 사용하는 비표준 인코딩 이름 보정 맵
+    encoding_map = {
+        'unicode': 'utf-16-be',
+        'ms1361': 'cp1361',
+        'ks_c_5601-1987': 'cp949',
+        'ksc5601': 'cp949'
+    }
+
     try:
         for part, encoding in decode_header(text_str):
             if isinstance(part, bytes):
-                decoded.append(part.decode(encoding or 'utf-8', errors='replace'))
+                if encoding:
+                    encoding = encoding.lower()
+                    encoding = encoding_map.get(encoding, encoding)
+                try:
+                    decoded.append(part.decode(encoding or 'utf-8', errors='replace'))
+                except LookupError:
+                    # 파이썬이 지원하지 않는 알 수 없는 인코딩일 경우 무시하고 utf-8로 강제 시도
+                    decoded.append(part.decode('utf-8', errors='replace'))
             else:
                 decoded.append(str(part))
     except: 
@@ -208,7 +228,8 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
 
         try:
             # 1. 메일 데이터 가져오기 (FETCH)
-            status, msg_data = server.uid('FETCH', uid, '(RFC822)')
+            # BODY.PEEK[]를 사용하여 메일을 읽을 때 서버에서 자동으로 읽음 처리되는 것을 방지합니다.
+            status, msg_data = server.uid('FETCH', uid, '(BODY.PEEK[])')
             if status != 'OK':
                 logger.warning(f"[{acc_id}] UID {uid} FETCH 실패, 건너뜁니다.")
                 continue
@@ -239,6 +260,7 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                 request = service.users().messages().import_(
                     userId='me',
                     internalDateSource='dateHeader',
+                    neverMarkSpam=True,  # 스팸/의심(피싱) 분류 판정을 무시하여 '의심 메시지' 배너 방지
                     body={'raw': encoded_raw, 'labelIds': ['INBOX', 'UNREAD']}
                 )
                 request.uri += '&processForFilters=true'
@@ -296,7 +318,8 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
 
 def main():
     if not run_once:
-        check_and_update()
+        if str(AUTO_UPDATE).upper() == 'YES':
+            check_and_update()
     logger.info(f"toGmail {TO_GMAIL_VERSION} 시작(순차/Polling 모드).")
     
     # 4시 무한 재시작 방지를 위해, 스크립트가 기동된 날짜를 기록
