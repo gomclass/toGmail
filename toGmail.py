@@ -17,6 +17,22 @@ try:
 except ImportError:
     AUTO_UPDATE = 'no'
 
+# [v1.4 업데이트 내역]
+# (2026-07-08)
+# 1. 에러 리포트 메일 HTML 주입(인젝션) 방지 처리 추가.
+#   - 문제: 리포트 본문에 삽입되는 제목/발신/사유는 외부(발신자)가 정하는 값인데,
+#           decode_mime_header()가 html.unescape()로 끝나 HTML 태그가 그대로 렌더링될 수 있었음.
+#           (예: 제목에 <a>/<img> 를 심어 피싱 링크·추적 픽셀 삽입 가능)
+#   - 조치: 본문 삽입용 safe_subject/safe_sender/safe_reason 변수를 만들어 html.escape() 적용.
+#   - 유지: msg['Subject'] 헤더와 로그는 텍스트라 이스케이프하지 않고 pretty_* 원문 사용.
+# (2026-07-11) — 일반 메일 안전성 개선(스팸 대응 코드의 전역 부작용 제거)
+# 2. 제목 HTML 엔티티 복원을 '숫자형(&#40; 등)'만으로 한정.
+#   - 문제: html.unescape()가 모든 제목에 적용돼, &amp;/&lt; 등이 든 정상 제목이 변형될 수 있었음.
+#   - 조치: named 엔티티는 두고 숫자형 문자참조만 복원(_unescape_numeric_entities).
+# 3. 제목 재작성+재직렬화(as_bytes)를 '비표준 charset/숫자엔티티 제목'에만 적용.
+#   - 문제: 모든 메일을 파싱→재직렬화해 전송, 정상 메일의 DKIM/서명이 깨질 여지가 있었음.
+#   - 조치: subject_needs_rewrite()가 True인 메일만 재작성, 표준 메일은 원본 raw 그대로 전송(무손실).
+
 # [v1.3 업데이트 내역]
 # 1. 자동 업데이트 기능 추가 (GitHub 원격 버전 체크 및 자가 파일 교체)
 # 2. 매일 새벽 4시 정기 종료 로직 추가 (Cron에 의한 재기동 및 자동 업데이트 유도)
@@ -29,10 +45,15 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.3"
+TO_GMAIL_VERSION="v1.4"
 COMMON_CREDENTIALS = "client_secret.json"
 TIMEOUT = 60
 socket.setdefaulttimeout(TIMEOUT)
+
+# [원인분석용] 메일 내용 전체 로깅 스위치.
+# 제목/본문 깨짐 등 디버깅이 필요할 때만 True로 켠다.
+# True면 본문 전문이 toGmail.log에 남으므로(개인정보) 평소에는 반드시 False 유지.
+DUMP_MAIL_CONTENT = False
 
 # ==========================================
 # [설정 구역] 로깅 및 실행 모드 설정
@@ -104,26 +125,48 @@ def get_gmail_service(token_filename):
     
     return build('gmail', 'v1', credentials=creds, static_discovery=False)
 
+# 스팸 메일 등에서 쓰는 비표준 인코딩 이름 → 표준 이름 보정 맵
+ENCODING_MAP = {
+    'unicode': 'utf-16-be',
+    'ms1361': 'cp1361',
+    'ks_c_5601-1987': 'cp949',
+    'ksc5601': 'cp949',
+}
+# 위 비표준 charset은 Gmail이 원본 그대로는 못 읽으므로, 이런 제목만 재작성 대상으로 삼는다.
+NONSTANDARD_CHARSETS = set(ENCODING_MAP)
+# 숫자형 HTML 문자참조(&#40; / &#xAB;)만 매칭. named 엔티티(&amp; &lt; 등)는 제외.
+_NUMERIC_ENTITY_RE = re.compile(r'&#(?:x[0-9a-fA-F]+|\d+);')
+# RFC2047 인코딩드워드에서 charset 부분만 추출( =?charset?B?...?= )
+_ENCODED_WORD_CHARSET_RE = re.compile(r'=\?([^?]+)\?[bBqQ]\?')
+
+def _unescape_numeric_entities(s):
+    """숫자형 HTML 문자참조(&#40; · &#xAB;)만 복원한다.
+    named 엔티티(&amp; &lt; &gt; 등)는 정상 메일 제목과 충돌 위험이 있어 건드리지 않는다."""
+    return _NUMERIC_ENTITY_RE.sub(lambda m: html.unescape(m.group(0)), s)
+
+def subject_needs_rewrite(raw_subject):
+    """Gmail이 '원본 그대로'는 제대로 표시하지 못하는 제목인지 판단한다.
+    - 비표준 charset(unicode/ms1361/ksc5601 등) 인코딩드워드를 포함하거나
+    - 숫자형 HTML 엔티티(&#40; 등)를 포함하면 재작성이 필요.
+    그 외 표준 메일은 원본 raw 바이트를 그대로 전송한다(무손실 · 서명 보존)."""
+    s = str(raw_subject)
+    for cs in _ENCODED_WORD_CHARSET_RE.findall(s):
+        if cs.strip().lower() in NONSTANDARD_CHARSETS:
+            return True
+    return bool(_NUMERIC_ENTITY_RE.search(s))
+
 def decode_mime_header(text):
     """MIME 인코딩된 헤더를 한글 텍스트로 변환하는 공통 함수"""
     if not text: return "Unknown"
     text_str = str(text)
     decoded = []
-    
-    # 스팸 메일 등에서 사용하는 비표준 인코딩 이름 보정 맵
-    encoding_map = {
-        'unicode': 'utf-16-be',
-        'ms1361': 'cp1361',
-        'ks_c_5601-1987': 'cp949',
-        'ksc5601': 'cp949'
-    }
 
     try:
         for part, encoding in decode_header(text_str):
             if isinstance(part, bytes):
                 if encoding:
                     encoding = encoding.lower()
-                    encoding = encoding_map.get(encoding, encoding)
+                    encoding = ENCODING_MAP.get(encoding, encoding)
                 try:
                     decoded.append(part.decode(encoding or 'utf-8', errors='replace'))
                 except LookupError:
@@ -131,9 +174,53 @@ def decode_mime_header(text):
                     decoded.append(part.decode('utf-8', errors='replace'))
             else:
                 decoded.append(str(part))
-    except: 
+    except:
         return text_str
-    return html.unescape("".join(decoded))
+    # named 엔티티는 그대로 두고 숫자형 문자참조만 복원(정상 제목 변형 방지)
+    return _unescape_numeric_entities("".join(decoded))
+
+def log_mail_content(acc_id, uid, email_msg, raw_subject, subject, raw_sender, sender):
+    """[원인분석용] 메일의 원본 헤더/디코딩 결과/본문 전체를 로그에 상세 기록한다.
+    제목·본문 깨짐(charset/인코딩) 원인 파악을 위해 raw 값과 charset 정보를 함께 남긴다."""
+    try:
+        lines = []
+        lines.append(f"[{acc_id}] ===== 메일 내용 덤프 시작 (UID: {uid}) =====")
+        lines.append(f"[{acc_id}] Raw Subject 헤더 : {raw_subject!r}")
+        lines.append(f"[{acc_id}] 디코딩 Subject   : {subject}")
+        lines.append(f"[{acc_id}] Raw From 헤더    : {raw_sender!r}")
+        lines.append(f"[{acc_id}] 디코딩 From      : {sender}")
+        lines.append(f"[{acc_id}] Date             : {email_msg.get('Date', '')}")
+        lines.append(f"[{acc_id}] Content-Type     : {email_msg.get('Content-Type', '')}")
+        lines.append(f"[{acc_id}] Content-Transfer-Encoding: {email_msg.get('Content-Transfer-Encoding', '')}")
+
+        part_index = 0
+        for part in email_msg.walk():
+            ctype = part.get_content_type()
+            charset = part.get_content_charset()
+            cte = part.get('Content-Transfer-Encoding', '')
+            disp = part.get_content_disposition()
+            if part.is_multipart():
+                lines.append(f"[{acc_id}] --- part#{part_index} (multipart) type={ctype}")
+                part_index += 1
+                continue
+            lines.append(f"[{acc_id}] --- part#{part_index} type={ctype} charset={charset} cte={cte} disp={disp}")
+            if ctype.startswith('text/') and disp != 'attachment':
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload is not None:
+                        text = payload.decode(charset or 'utf-8', errors='replace')
+                    else:
+                        text = str(part.get_payload())
+                    lines.append(f"[{acc_id}] 본문(part#{part_index}) ↓↓↓\n{text}\n[{acc_id}] 본문(part#{part_index}) ↑↑↑")
+                except Exception as be:
+                    lines.append(f"[{acc_id}] 본문 디코딩 실패(part#{part_index}): {be}")
+            else:
+                lines.append(f"[{acc_id}] (첨부/비텍스트 파트: filename={part.get_filename()}, 본문 생략)")
+            part_index += 1
+        lines.append(f"[{acc_id}] ===== 메일 내용 덤프 끝 (UID: {uid}) =====")
+        logger.info("\n".join(lines))
+    except Exception as e:
+        logger.error(f"[{acc_id}] 메일 내용 덤프 실패(UID: {uid}): {e}")
 
 def get_trash_folder(server):
     """IMAP 서버의 휴지통 폴더명을 자동 탐색합니다."""
@@ -167,6 +254,11 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
     pretty_subject = decode_mime_header(subject)
     pretty_sender = decode_mime_header(sender)
 
+    # HTML 리포트 본문 삽입용: HTML 주입 방지를 위해 이스케이프 (헤더/로그용 pretty_* 는 원문 유지)
+    safe_subject = html.escape(pretty_subject)
+    safe_sender = html.escape(pretty_sender)
+    safe_reason = html.escape(str(reason))
+
     # 메일 객체 생성 (HTML을 지원하기 위해 MIMEMultipart 사용)
     msg = MIMEMultipart('alternative')
     # 지메일 목록에서도 한글로 보이도록 제목도 인코딩하여 설정
@@ -181,9 +273,9 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
         <h3 style="color: #d93025;">⚠️ Gmail Import 에러 리포트</h3>
         <table border="1" style="border-collapse: collapse; width: 100%; max-width: 600px; table-layout: fixed;">
           <colgroup><col style="width: 25%;"><col style="width: 75%;"></colgroup>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">제목</td><td style="padding: 10px;">{pretty_subject}</td></tr>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">발신</td><td style="padding: 10px;">{pretty_sender}</td></tr>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold; color: #d93025;">사유</td><td style="padding: 10px; color: #d93025;">{reason}</td></tr>
+          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">제목</td><td style="padding: 10px;">{safe_subject}</td></tr>
+          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">발신</td><td style="padding: 10px;">{safe_sender}</td></tr>
+          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold; color: #d93025;">사유</td><td style="padding: 10px; color: #d93025;">{safe_reason}</td></tr>
         </table>
         <br>
         <a href="{bizmeka_url}" style="background-color: #1a73e8; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">웹메일 바로가기</a>
@@ -248,10 +340,18 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
             raw_sender = email_msg.get('From', '')
             sender = decode_mime_header(raw_sender)
 
-            # 실제 Gmail에 업로드되는 원본 메일 객체의 제목도 디코딩된 정상 텍스트로 교체
-            if 'Subject' in email_msg:
+            # [원인분석용] 제목/본문 깨짐 원인 파악을 위해 메일 내용 전체를 로그에 기록
+            # (평소엔 DUMP_MAIL_CONTENT=False 로 비활성화)
+            if DUMP_MAIL_CONTENT:
+                log_mail_content(acc_id, uid, email_msg, raw_subject, subject, raw_sender, sender)
+
+            # 제목 재작성이 필요한 '비표준' 메일만 파싱·재직렬화하고,
+            # 표준 메일은 원본 raw 바이트를 그대로 전송한다(바이트 무손실 · DKIM/서명 보존).
+            if subject_needs_rewrite(raw_subject) and 'Subject' in email_msg:
                 email_msg.replace_header('Subject', Header(subject, 'utf-8').encode())
-            modified_raw_content = email_msg.as_bytes()
+                modified_raw_content = email_msg.as_bytes()
+            else:
+                modified_raw_content = raw_content
 
             # 2. Gmail로 가져오기 (Import)
             try:
