@@ -17,6 +17,49 @@ try:
 except ImportError:
     AUTO_UPDATE = 'no'
 
+# [v1.5 업데이트 내역] (테스트 기간 — TO_GMAIL_VERSION은 아직 v1.4 유지)
+# (2026-08-25)
+# 1. 에러 리포트 표의 '사유' 행 테두리가 빨강으로 보이던 문제 수정.
+#   - 문제: <table border="1">은 테두리 색을 지정하지 않으면 셀의 color를 상속한다.
+#           '사유' 행 td에 color:#d93025(빨강)를 줘서 글씨뿐 아니라 세로줄/아래줄까지 빨강으로 렌더링됨.
+#   - 조치: border 속성을 제거하고 table/td에 border:1px solid #000000 을 직접 지정.
+#           글씨 색(빨강)은 그대로 두고 표 줄만 검정으로 고정.
+#   - 참고: Gmail 등 메일 클라이언트는 CSS 상속이 제한적이라 td마다 인라인 border를 개별 지정해야 함.
+# (2026-08-28)
+# 2. 인코딩드워드(base64/QP) 안에 숨은 숫자형 HTML 엔티티 제목이 Gmail에서 깨지던 문제 수정.
+#   - 사례: 원본 제목이 =?UTF-8?B?...?= 로 인코딩돼 있고, base64를 풀면 안쪽에 &#40;주&#41; 가 들어있음.
+#           (발신 측 홈페이지 문의 폼이 괄호를 HTML 엔티티로 이스케이프한 채 Subject에 넣어 발송)
+#   - 문제: subject_needs_rewrite()가 '디코딩 전 raw 헤더'만 검사해서 엔티티를 못 찾았다.
+#           charset도 UTF-8(표준)이라 재작성 조건이 모두 불성립 → 원본 raw 그대로 전송 →
+#           비즈메카 웹메일은 제목을 HTML로 렌더링해 (주)로 보이지만, Gmail은 텍스트로 취급해 &#40;주&#41; 노출.
+#   - 조치: MIME 디코딩만 하고 엔티티는 복원하지 않는 _decode_mime_header_raw()를 분리하고,
+#           subject_needs_rewrite(raw_subject, decoded_subject)가 '디코딩 후·복원 전' 문자열까지 검사하도록 확장.
+#   - 영향: 이 유형의 메일은 재직렬화 대상이 되므로 DKIM 서명은 깨진다(기존 비표준 메일과 동일한 트레이드오프).
+#           엔티티가 없는 표준 메일은 종전대로 원본 raw 무손실 전송.
+# (2026-08-28)
+# 3. 메시지 재직렬화 시 줄바꿈이 CRLF에서 bare LF로 바뀌던 문제 수정.
+#   - 문제: Message.as_bytes()는 기본 policy(compat32)의 linesep='\n'을 써서
+#           원본의 CRLF를 전부 bare LF로 바꿔 내보냈다(실측: CRLF 323 → 0, lone LF 331).
+#           본문 내용 자체는 보존되지만 RFC 5322는 헤더/본문 줄바꿈을 CRLF로 규정한다.
+#           지금까지는 Gmail API가 관대해 문제없이 이관됐으나 원본 바이트를 살리는 편이 안전하다.
+#   - 조치: message_to_crlf_bytes()를 만들어 policy.clone(linesep='\r\n')으로 직렬화.
+#           제목 재작성 경로와 에러 리포트 발송 경로 양쪽에 적용.
+#   - 범위: 재작성 대상(비표준 charset · 숫자엔티티 제목) 메일에만 해당. 표준 메일은 애초에
+#           재직렬화를 거치지 않고 원본 raw 그대로 전송되므로 영향이 없다.
+#   - 참고: DKIM은 복구 불가. subject가 서명 대상 h=에 포함되고 본문 해시(bh)도 재직렬화로
+#           달라져 재작성 대상 메일의 서명은 깨진다(실측 확인). 단 Gmail messages.import_ 는
+#           DKIM을 재검증하지 않아(수신본에 Gmail의 Authentication-Results/ARC 없음) 실사용 영향은 없다.
+# (2026-08-31)
+# 4. error_action="휴지통이동" 에서 COPY 실패 시 폴백이 없던 문제 수정.
+#   - 문제: 불량 메일(400) 처리 분기의 휴지통 이동은 COPY 성공 시에만 STORE \Deleted + expunge 하고,
+#           실패하면 아무 조치 없이 continue 했다. 메일 수집이 SEARCH UNSEEN 이므로 메일은
+#           UNSEEN 상태로 INBOX에 남고, cron 1분 주기로 import 재실패 + 에러 리포트 재발송이
+#           무한 반복된다(리포트 메일 폭주).
+#   - 조치: success_action 경로와 동일하게 else 폴백을 추가해 읽음 처리(\Seen)로 대체하고
+#           logger.warning 을 남긴다. 최소한 재시도 루프는 끊긴다.
+#   - 참고: 현재 config.py 4계정 모두 error_action="읽음처리"라 실사용 노출은 없었다.
+#           휴지통이동으로 바꿔도 안전하도록 미리 보강한 것.
+
 # [v1.4 업데이트 내역]
 # (2026-07-08)
 # 1. 에러 리포트 메일 HTML 주입(인젝션) 방지 처리 추가.
@@ -45,7 +88,7 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.4"
+TO_GMAIL_VERSION="v1.5"
 COMMON_CREDENTIALS = "client_secret.json"
 TIMEOUT = 60
 socket.setdefaulttimeout(TIMEOUT)
@@ -144,19 +187,32 @@ def _unescape_numeric_entities(s):
     named 엔티티(&amp; &lt; &gt; 등)는 정상 메일 제목과 충돌 위험이 있어 건드리지 않는다."""
     return _NUMERIC_ENTITY_RE.sub(lambda m: html.unescape(m.group(0)), s)
 
-def subject_needs_rewrite(raw_subject):
+def message_to_crlf_bytes(msg):
+    """메시지를 RFC 5322 규격대로 CRLF 줄바꿈으로 직렬화한다.
+    msg.as_bytes()는 기본 policy의 linesep이 '\n'이라 원본 CRLF가 bare LF로 바뀐다.
+    (본문 내용 자체는 보존되지만 원본 바이트가 달라지므로 CRLF를 유지한다.)"""
+    return msg.as_bytes(policy=msg.policy.clone(linesep='\r\n'))
+
+def subject_needs_rewrite(raw_subject, decoded_subject=None):
     """Gmail이 '원본 그대로'는 제대로 표시하지 못하는 제목인지 판단한다.
     - 비표준 charset(unicode/ms1361/ksc5601 등) 인코딩드워드를 포함하거나
     - 숫자형 HTML 엔티티(&#40; 등)를 포함하면 재작성이 필요.
-    그 외 표준 메일은 원본 raw 바이트를 그대로 전송한다(무손실 · 서명 보존)."""
+    그 외 표준 메일은 원본 raw 바이트를 그대로 전송한다(무손실 · 서명 보존).
+
+    decoded_subject: MIME 디코딩만 끝내고 엔티티 복원은 하지 않은 문자열.
+      엔티티가 =?UTF-8?B?...?= 안쪽에 숨어 있으면 raw 헤더에는 &#40; 가 보이지 않으므로
+      디코딩 결과까지 함께 검사해야 한다."""
     s = str(raw_subject)
     for cs in _ENCODED_WORD_CHARSET_RE.findall(s):
         if cs.strip().lower() in NONSTANDARD_CHARSETS:
             return True
-    return bool(_NUMERIC_ENTITY_RE.search(s))
+    if _NUMERIC_ENTITY_RE.search(s):
+        return True
+    return bool(decoded_subject and _NUMERIC_ENTITY_RE.search(str(decoded_subject)))
 
-def decode_mime_header(text):
-    """MIME 인코딩된 헤더를 한글 텍스트로 변환하는 공통 함수"""
+def _decode_mime_header_raw(text):
+    """MIME 인코딩드워드만 디코딩한다(HTML 엔티티는 복원하지 않음).
+    재작성 필요 여부 판단용 — 엔티티가 인코딩드워드 안에 숨어 있는지 보려면 이 값이 필요하다."""
     if not text: return "Unknown"
     text_str = str(text)
     decoded = []
@@ -176,8 +232,12 @@ def decode_mime_header(text):
                 decoded.append(str(part))
     except:
         return text_str
-    # named 엔티티는 그대로 두고 숫자형 문자참조만 복원(정상 제목 변형 방지)
-    return _unescape_numeric_entities("".join(decoded))
+    return "".join(decoded)
+
+def decode_mime_header(text):
+    """MIME 인코딩된 헤더를 한글 텍스트로 변환하는 공통 함수.
+    named 엔티티는 그대로 두고 숫자형 문자참조만 복원한다(정상 제목 변형 방지)."""
+    return _unescape_numeric_entities(_decode_mime_header_raw(text))
 
 def log_mail_content(acc_id, uid, email_msg, raw_subject, subject, raw_sender, sender):
     """[원인분석용] 메일의 원본 헤더/디코딩 결과/본문 전체를 로그에 상세 기록한다.
@@ -271,11 +331,11 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
     <html>
       <body style="font-family: sans-serif;">
         <h3 style="color: #d93025;">⚠️ Gmail Import 에러 리포트</h3>
-        <table border="1" style="border-collapse: collapse; width: 100%; max-width: 600px; table-layout: fixed;">
+        <table style="border-collapse: collapse; width: 100%; max-width: 600px; table-layout: fixed; border: 1px solid #000000;">
           <colgroup><col style="width: 25%;"><col style="width: 75%;"></colgroup>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">제목</td><td style="padding: 10px;">{safe_subject}</td></tr>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold;">발신</td><td style="padding: 10px;">{safe_sender}</td></tr>
-          <tr><td style="padding: 10px; background: #fafafa; font-weight: bold; color: #d93025;">사유</td><td style="padding: 10px; color: #d93025;">{safe_reason}</td></tr>
+          <tr><td style="border: 1px solid #000000; padding: 10px; background: #fafafa; font-weight: bold;">제목</td><td style="border: 1px solid #000000; padding: 10px;">{safe_subject}</td></tr>
+          <tr><td style="border: 1px solid #000000; padding: 10px; background: #fafafa; font-weight: bold;">발신</td><td style="border: 1px solid #000000; padding: 10px;">{safe_sender}</td></tr>
+          <tr><td style="border: 1px solid #000000; padding: 10px; background: #fafafa; font-weight: bold; color: #d93025;">사유</td><td style="border: 1px solid #000000; padding: 10px; color: #d93025;">{safe_reason}</td></tr>
         </table>
         <br>
         <a href="{bizmeka_url}" style="background-color: #1a73e8; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">웹메일 바로가기</a>
@@ -285,7 +345,7 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
     
     msg.attach(MIMEText(html_content, 'html', 'utf-8'))
     
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    raw = base64.urlsafe_b64encode(message_to_crlf_bytes(msg)).decode()
     
     # [변경 포인트] import_() 대신 send() 사용
     try:
@@ -336,7 +396,10 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                 
             email_msg = message_from_bytes(raw_content)
             raw_subject = email_msg.get('Subject', '')
-            subject = decode_mime_header(raw_subject)
+            # 엔티티 복원 전(decoded_subject)과 복원 후(subject)를 모두 확보한다.
+            # 복원 후 값만으로는 '원래 엔티티가 있었는지'를 알 수 없어 재작성 판정이 불가능하다.
+            decoded_subject = _decode_mime_header_raw(raw_subject)
+            subject = _unescape_numeric_entities(decoded_subject)
             raw_sender = email_msg.get('From', '')
             sender = decode_mime_header(raw_sender)
 
@@ -347,9 +410,9 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
 
             # 제목 재작성이 필요한 '비표준' 메일만 파싱·재직렬화하고,
             # 표준 메일은 원본 raw 바이트를 그대로 전송한다(바이트 무손실 · DKIM/서명 보존).
-            if subject_needs_rewrite(raw_subject) and 'Subject' in email_msg:
+            if subject_needs_rewrite(raw_subject, decoded_subject) and 'Subject' in email_msg:
                 email_msg.replace_header('Subject', Header(subject, 'utf-8').encode())
-                modified_raw_content = email_msg.as_bytes()
+                modified_raw_content = message_to_crlf_bytes(email_msg)
             else:
                 modified_raw_content = raw_content
 
@@ -387,6 +450,12 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                             server.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
                             server.expunge()
                             logger.info(f"[{acc_id}] - 불량 메일 휴지통 이동 완료.")
+                        else:
+                            # COPY 실패 시 읽음 처리로 대체(success_action 경로와 동일 방침).
+                            # 폴백이 없으면 메일이 UNSEEN으로 남아 SEARCH UNSEEN에 매번 다시 걸리고,
+                            # cron 1분 주기로 import 재실패 + 에러 리포트 재발송이 무한 반복된다.
+                            server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+                            logger.warning(f"[{acc_id}] - 불량 메일 휴지통 복사 실패로 읽음 처리만 됨.")
                     
                     continue # 다음 메일로 넘어감
                 else:
