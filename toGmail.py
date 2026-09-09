@@ -17,7 +17,38 @@ try:
 except ImportError:
     AUTO_UPDATE = 'no'
 
-# [v1.5 업데이트 내역] (테스트 기간 — TO_GMAIL_VERSION은 아직 v1.4 유지)
+# [v1.6 업데이트 내역]
+# (2026-09-01)
+# 1. 에러 리포트의 '웹메일 바로가기' 버튼이 전 계정에 비즈메카 링크로 나가던 문제 수정.
+#   - 문제: send_error_report() 안에 URL이 상수(bizmeka_url)로 박혀 있어 계정별 분기가 아예 없었다.
+#           naver/kakao/daum 계정에서 난 에러 리포트에도 비즈메카 웹메일 링크가 그대로 붙었다.
+#           애초에 계정 정보(imap host)가 main() -> process_unread() -> send_error_report() 경로로
+#           전달되지 않아(conn 딕셔너리에 host를 담지 않음) 분기할 근거 자체가 없었다.
+#   - 조치: WEBMAIL_URLS 맵(IMAP 호스트 -> 웹메일 주소)과 get_webmail_url(imap_host)를 두어
+#           계정별로 맞는 링크를 붙인다. 현재 등록된 4곳:
+#             ezmail.bizmeka.com -> ezwebmail.bizmeka.com/mail/list.do
+#             imap.naver.com     -> mail.naver.com
+#             imap.kakao.com     -> mail.kakao.com
+#             imap.daum.net      -> mail.daum.net
+#           맵에 없는 메일 서버는 None -> 버튼 자체를 리포트에서 생략한다.
+#           모르는 서버에 엉뚱한 링크를 붙이느니 버튼을 빼는 쪽이 안전하다는 판단.
+#           main()에서 계정별로 한 번 계산해 conn["webmail_url"]에 담고 호출 경로로 넘긴다.
+#   - 참고: 리포트 메일의 To/From은 IMAP 계정이 아니라 Gmail 프로필 주소이고, 4계정이 토큰을 공유해
+#           전부 같은 편지함으로 자기발송된다. 그래서 링크가 틀린 것이 그동안 드러나지 않았다.
+#           계정을 추가할 때는 config.py의 imap host를 키로 WEBMAIL_URLS에 한 줄 추가하면 된다.
+# 2. 자동 업데이트 판정을 '버전이 다르면'에서 '원격이 더 높으면'으로 변경.
+#   - 문제: check_and_update()가 remote_version != TO_GMAIL_VERSION 으로 비교해 방향이 없었다.
+#           서버가 GitHub보다 앞선 버전이면 새벽 4시 재기동 때 옛 버전으로 되돌아간다(다운그레이드).
+#           테스트 기간에 버전 상수를 일부러 안 올리고 묶어두던 것도 이 동작을 피하기 위한 우회였다.
+#   - 조치: parse_version()으로 'v1.6' -> (1, 6) 정수 튜플로 파싱한 뒤 remote > local 일 때만 교체.
+#           버전은 v1.9 -> v1.10, v1.99 -> v1.100 으로 올라가므로(자릿수 무제한)
+#           문자열 비교는 'v1.10' < 'v1.9', 'v1.100' < 'v1.99' 로 뒤집힌다. 반드시 튜플로 비교한다.
+#           버전 형식을 못 읽으면 업데이트하지 않고 warning만 남긴다(모르는 상태에서 덮어쓰기 금지).
+#   - 효과: 로컬/서버를 GitHub보다 앞서 올려두고 테스트해도 되돌아가지 않는다.
+#           단, 이 수정과 TO_GMAIL_VERSION 상향은 반드시 같은 파일로 함께 배포해야 한다.
+#           (버전만 올리고 옛 != 로직으로 배포하면 그 코드가 스스로를 옛 버전으로 덮어쓴다)
+
+# [v1.5 업데이트 내역]
 # (2026-08-25)
 # 1. 에러 리포트 표의 '사유' 행 테두리가 빨강으로 보이던 문제 수정.
 #   - 문제: <table border="1">은 테두리 색을 지정하지 않으면 셀의 color를 상속한다.
@@ -88,7 +119,7 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.5"
+TO_GMAIL_VERSION="v1.6"
 COMMON_CREDENTIALS = "client_secret.json"
 TIMEOUT = 60
 socket.setdefaulttimeout(TIMEOUT)
@@ -97,6 +128,18 @@ socket.setdefaulttimeout(TIMEOUT)
 # 제목/본문 깨짐 등 디버깅이 필요할 때만 True로 켠다.
 # True면 본문 전문이 toGmail.log에 남으므로(개인정보) 평소에는 반드시 False 유지.
 DUMP_MAIL_CONTENT = False
+
+# 에러 리포트의 '웹메일 바로가기' 버튼용 URL 맵 (IMAP 호스트 -> 웹메일 주소).
+# 여기 등록되지 않은 메일 서버는 버튼 자체를 표시하지 않는다.
+# (예전에는 비즈메카 URL이 하드코딩돼 있어 네이버/카카오/다음 리포트에도 같은 링크가 나갔다.
+#  모르는 서버에 엉뚱한 링크를 붙이느니 버튼을 빼는 쪽이 안전하다)
+# 계정을 추가할 때는 config.py의 imap host를 키로 여기에 한 줄 추가하면 된다.
+WEBMAIL_URLS = {
+    "ezmail.bizmeka.com": "https://ezwebmail.bizmeka.com/mail/list.do",
+    "imap.naver.com":     "https://mail.naver.com",
+    "imap.kakao.com":     "https://mail.kakao.com",
+    "imap.daum.net":      "https://mail.daum.net",
+}
 
 # ==========================================
 # [설정 구역] 로깅 및 실행 모드 설정
@@ -119,8 +162,24 @@ else:
     logger.addHandler(file_handler)
 # ==========================================
 
+def parse_version(version_str):
+    """'v1.6' -> (1, 6) 형태의 정수 튜플. 형식을 못 읽으면 None.
+
+    버전은 v1.9 다음이 v1.10, v1.99 다음이 v1.100 으로 올라간다(자릿수 무제한).
+    그래서 문자열 비교를 쓰면 안 된다 — 'v1.10' < 'v1.9', 'v1.100' < 'v1.99' 로 뒤집혀
+    업데이트가 영영 안 걸린다. 반드시 정수 튜플로 파싱해서 비교할 것.
+    """
+    m = re.fullmatch(r'v?(\d+(?:\.\d+)*)', (version_str or "").strip(), re.IGNORECASE)
+    if not m:
+        return None
+    return tuple(int(x) for x in m.group(1).split('.'))
+
 def check_and_update():
-    """GitHub에서 최신 버전을 확인하고, 버전이 다르면 다운로드 및 교체 후 종료합니다."""
+    """GitHub에서 최신 버전을 확인하고, 원격이 더 높은 버전이면 다운로드 및 교체 후 종료합니다.
+
+    '다르면'이 아니라 '더 높으면'이다. 로컬/서버를 GitHub보다 앞서 올려두고 테스트하는 동안
+    새벽 4시 재기동이 옛 버전으로 되돌리는(다운그레이드) 일을 막기 위함이다.
+    """
     update_url = "https://raw.githubusercontent.com/gomclass/toGmail/refs/heads/main/toGmail.py"
     try:
         req = urllib.request.Request(update_url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -131,7 +190,15 @@ def check_and_update():
         match = re.search(r'TO_GMAIL_VERSION\s*=\s*["\']([^"\']+)["\']', content)
         if match:
             remote_version = match.group(1)
-            if remote_version != TO_GMAIL_VERSION:
+            remote_v = parse_version(remote_version)
+            local_v = parse_version(TO_GMAIL_VERSION)
+
+            # 버전 형식을 못 읽으면 덮어쓰지 않고 넘어간다(모르는 상태에서 교체하는 게 가장 위험하다)
+            if remote_v is None or local_v is None:
+                logger.warning(f"버전 형식을 해석할 수 없어 업데이트를 건너뜁니다. "
+                               f"(원격: {remote_version} / 현재: {TO_GMAIL_VERSION})")
+            # '다르면'이 아니라 '원격이 더 높으면'. 서버가 앞서 있어도 되돌아가지 않는다.
+            elif remote_v > local_v:
                 logger.info(f"새 버전({remote_version})을 발견했습니다. (현재: {TO_GMAIL_VERSION})업데이트를 진행합니다.")
                 
                 # 문법 검사 (오류 발생 시 예외 발생하여 덮어쓰기 방지)
@@ -306,9 +373,16 @@ def get_trash_folder(server):
         pass
     return "Trash"
 
-def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
-    """에러 발생 시 클릭 가능한 링크가 포함된 HTML 리포트 발송"""
-    bizmeka_url = "https://ezwebmail.bizmeka.com/mail/list.do"
+def get_webmail_url(imap_host):
+    """계정 IMAP 호스트에 맞는 웹메일 URL. 등록되지 않은 호스트면 None(버튼을 붙이지 않는다)."""
+    return WEBMAIL_URLS.get((imap_host or "").strip().lower())
+
+def send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url=None):
+    """에러 발생 시 클릭 가능한 링크가 포함된 HTML 리포트 발송
+
+    webmail_url이 None이면 '웹메일 바로가기' 버튼을 넣지 않는다.
+    (WEBMAIL_URLS에 등록되지 않은 메일 서버. 아무 링크나 붙이면 엉뚱한 곳으로 보내게 된다)
+    """
     
     # 전달받은 subject, sender는 메일 추출 시 1차 디코딩되지만, 안전을 위해 한 번 더 처리
     pretty_subject = decode_mime_header(subject)
@@ -326,6 +400,15 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
     msg['To'] = my_email
     msg['From'] = my_email
 
+    # 웹메일 바로가기 버튼: URL을 아는 계정(비즈메카)일 때만 붙인다.
+    # URL 이스케이프는 값의 출처가 우리 상수라 지금은 불필요하지만, 리포트 본문 삽입값은
+    # 모두 이스케이프한다는 v1.4 1번(HTML 주입 방지) 규칙과 결을 맞춰 유지한다.
+    button_html = ""
+    if webmail_url:
+        safe_webmail_url = html.escape(webmail_url, quote=True)
+        button_html = f'''<br>
+        <a href="{safe_webmail_url}" style="background-color: #1a73e8; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">웹메일 바로가기</a>'''
+
     # [수정] HTML 서식: 항목 열 너비 증가 및 스타일 보강
     html_content = f"""
     <html>
@@ -337,8 +420,7 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
           <tr><td style="border: 1px solid #000000; padding: 10px; background: #fafafa; font-weight: bold;">발신</td><td style="border: 1px solid #000000; padding: 10px;">{safe_sender}</td></tr>
           <tr><td style="border: 1px solid #000000; padding: 10px; background: #fafafa; font-weight: bold; color: #d93025;">사유</td><td style="border: 1px solid #000000; padding: 10px; color: #d93025;">{safe_reason}</td></tr>
         </table>
-        <br>
-        <a href="{bizmeka_url}" style="background-color: #1a73e8; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; font-weight: bold; display: inline-block;">웹메일 바로가기</a>
+        {button_html}
       </body>
     </html>
     """
@@ -357,7 +439,7 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id):
     except Exception as e:
         logger.error(f"[{acc_id}] !!! 에러 리포트 발송 실패: {e}")
 
-def process_unread(server, service, acc_id, my_email, trash_folder, success_action, error_action):
+def process_unread(server, service, acc_id, my_email, trash_folder, success_action, error_action, webmail_url=None):
     """INBOX에서 읽지 않은 메일을 검색하여 처리합니다."""
     try:
         server.select("INBOX")
@@ -436,7 +518,7 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                     logger.info(f"[{acc_id}] - 스킵(불량메일): {subject[:40]}... 이유: {reason}")
                     
                     try:
-                        send_error_report(service, my_email, uid, subject, sender, reason, acc_id)
+                        send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url)
                     except Exception as report_err:
                         logger.error(f"[{acc_id}]   [!] 에러 리포트 발송 실패: {report_err}")
                     
@@ -532,6 +614,8 @@ def main():
                     "service": service,
                     "trash_folder": trash_folder,
                     "my_email": my_email,
+                    # 계정별 웹메일 바로가기 URL(비즈메카 외에는 None -> 버튼 생략)
+                    "webmail_url": get_webmail_url(config["imap"]["host"]),
                     "polling_time": config.get("polling_time", 60),
                     "success_action": config.get("success_action", "휴지통이동"),
                     "error_action": config.get("error_action", "읽음처리"),
@@ -562,7 +646,8 @@ def main():
                             conn["my_email"], 
                             conn["trash_folder"],
                             conn["success_action"],
-                            conn["error_action"]
+                            conn["error_action"],
+                            conn["webmail_url"]
                         )
                     except Exception as e:
                         logger.error(f"[{conn['acc_id']}] 처리 중 치명적 오류 발생: {e}")
