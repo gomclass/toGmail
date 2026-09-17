@@ -1,4 +1,4 @@
-import os, imaplib, base64, socket, sys, time, re, html, logging, urllib.request
+import os, imaplib, base64, socket, sys, time, re, html, json, logging, urllib.request
 imaplib._MAXLINE = 10 * 1024 * 1024 # 기본값 2048을 10MB로 상향 (긴 줄이 포함된 메일 처리용)
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -16,6 +16,22 @@ try:
     from config import AUTO_UPDATE
 except ImportError:
     AUTO_UPDATE = 'no'
+
+# [v1.7 업데이트 내역]
+# (2026-09-17)
+# 1. 같은 메일이 Gmail에 여러 번 이관되던 문제 대응 — 처리 완료 Message-ID 로컬 기록.
+#   - 사례: 비즈메카 계정에서 제목이 같은 메일이 '성공(휴지통 이동)'으로 3회 로그되고 Gmail에는 4통 입력,
+#           원본 휴지통에는 1통만 존재. 같은 메일이 SEARCH UNSEEN에 반복해서 잡힌 것으로 추정.
+#           (중복 배달 / 휴지통 이동 미반영 / 다중 인스턴스 / Gmail 타임아웃 후 재시도 등 원인 후보 복수)
+#   - 조치: import 성공 직후 Message-ID를 processed_ids.json 에 계정별 최근 100개까지 기록한다.
+#           이미 기록된 Message-ID면 import 없이 success_action(휴지통이동/읽음처리)만 수행한다.
+#           UID는 편지함 안에서만 유일하고 중복 배달 사본마다 달라 중복 판정 키로 쓸 수 없다.
+#           Message-ID 헤더가 없는 메일은 중복 판정 없이 종전대로 처리한다(오판으로 누락시키지 않음).
+#           재시작(새벽 4시/오류 종료) 후에도 유지되도록 파일에 원자적으로 저장한다.
+# 2. 로그에 UID와 Message-ID를 함께 기록 — 같은 메일의 재처리인지 별개 사본인지 구분하기 위함.
+# 3. 세션 유지 시간 3분 -> 2분 (SESSION_SECONDS).
+# 4. 소켓 타임아웃 60초 -> 120초 (TIMEOUT). 대용량 메일 import가 60초 경계(실측 약 57초)에 걸려
+#    Gmail에는 저장됐는데 클라이언트는 타임아웃으로 실패 처리 -> 재시작 후 재이관되는 경우를 줄인다.
 
 # [v1.6 업데이트 내역]
 # (2026-09-01)
@@ -119,10 +135,19 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.6"
+TO_GMAIL_VERSION="v1.7"
 COMMON_CREDENTIALS = "client_secret.json"
-TIMEOUT = 60
+# IMAP 소켓과 Gmail API(httplib2: build_http()가 socket.getdefaulttimeout()을 따름) 양쪽에 적용된다.
+TIMEOUT = 120
 socket.setdefaulttimeout(TIMEOUT)
+
+# 세션 유지 시간(초). 경과하면 IMAP/Gmail 연결을 끊고 재접속한다.
+SESSION_SECONDS = 120
+
+# 처리 완료 메일의 Message-ID 기록 파일(중복 이관 방지). 계정(config id)별로 최근 N개만 보관한다.
+PROCESSED_IDS_FILE = "processed_ids.json"
+PROCESSED_IDS_MAX = 100
+processed_ids = {}  # {acc_id: [Message-ID, ...]} — main() 시작 시 파일에서 읽어 채운다.
 
 # [원인분석용] 메일 내용 전체 로깅 스위치.
 # 제목/본문 깨짐 등 디버깅이 필요할 때만 True로 켠다.
@@ -439,6 +464,54 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id, w
     except Exception as e:
         logger.error(f"[{acc_id}] !!! 에러 리포트 발송 실패: {e}")
 
+def load_processed_ids():
+    """processed_ids.json -> {acc_id: [Message-ID, ...]} (오래된 것이 앞). 없거나 깨졌으면 빈 dict."""
+    if not os.path.exists(PROCESSED_IDS_FILE):
+        return {}
+    try:
+        with open(PROCESSED_IDS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("최상위가 dict가 아님")
+        return {k: [x for x in v if isinstance(x, str)][-PROCESSED_IDS_MAX:]
+                for k, v in data.items() if isinstance(v, list)}
+    except Exception as e:
+        logger.warning(f"{PROCESSED_IDS_FILE} 읽기 실패, 빈 기록으로 시작합니다: {e}")
+        return {}
+
+def remember_processed_id(acc_id, message_id):
+    """계정별 최근 PROCESSED_IDS_MAX개만 남기고 파일에 원자적으로 저장한다."""
+    ids = processed_ids.setdefault(acc_id, [])
+    if message_id in ids:
+        ids.remove(message_id)
+    ids.append(message_id)
+    del ids[:-PROCESSED_IDS_MAX]
+    temp_file = PROCESSED_IDS_FILE + ".tmp"
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(processed_ids, f, ensure_ascii=False, indent=1)
+        os.replace(temp_file, PROCESSED_IDS_FILE)
+    except Exception as e:
+        # 기록 실패로 이관 자체를 멈추지는 않는다(메모리 기록은 유지되어 이번 실행 동안은 유효).
+        logger.error(f"[{acc_id}] {PROCESSED_IDS_FILE} 저장 실패: {e}")
+
+def apply_success_action(server, uid, acc_id, trash_folder, success_action, label, info):
+    """import 완료(또는 이미 이관된 중복) 메일의 원본 후처리.
+    label: 로그 구분(성공/중복스킵), info: 제목·UID·Message-ID 요약 문자열."""
+    if success_action == "휴지통이동":
+        copy_status, _ = server.uid('COPY', uid, f'"{trash_folder}"')
+        if copy_status == 'OK':
+            server.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
+            server.expunge()
+            logger.info(f"[{acc_id}] - {label}(휴지통 이동): {info}")
+            return
+        # 복사 실패 시 읽음 처리로 대체
+        server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+        logger.warning(f"[{acc_id}] - {label}(휴지통 복사 실패로 읽음 처리만 됨): {info}")
+    elif success_action == "읽음처리":
+        server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+        logger.info(f"[{acc_id}] - {label}(읽음 처리): {info}")
+
 def process_unread(server, service, acc_id, my_email, trash_folder, success_action, error_action, webmail_url=None):
     """INBOX에서 읽지 않은 메일을 검색하여 처리합니다."""
     try:
@@ -484,6 +557,14 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
             subject = _unescape_numeric_entities(decoded_subject)
             raw_sender = email_msg.get('From', '')
             sender = decode_mime_header(raw_sender)
+            message_id = (email_msg.get('Message-ID') or '').strip()
+            info = f"{subject[:40]} (UID: {uid}, Message-ID: {message_id or '없음'})"
+
+            # 이미 이관한 Message-ID면 import 없이 원본 후처리만 한다(중복 이관 방지).
+            # Message-ID가 없는 메일은 판정 근거가 없어 종전대로 처리한다.
+            if message_id and message_id in processed_ids.get(acc_id, []):
+                apply_success_action(server, uid, acc_id, trash_folder, success_action, "중복 스킵(이미 이관됨)", info)
+                continue
 
             # [원인분석용] 제목/본문 깨짐 원인 파악을 위해 메일 내용 전체를 로그에 기록
             # (평소엔 DUMP_MAIL_CONTENT=False 로 비활성화)
@@ -510,12 +591,16 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                 )
                 request.uri += '&processForFilters=true'
                 request.execute()
+                # import 성공 즉시 기록한다. 이후 휴지통 이동이 실패하거나 프로세스가 죽어도
+                # 다음 처리에서 같은 메일을 다시 import하지 않도록.
+                if message_id:
+                    remember_processed_id(acc_id, message_id)
                 
             except HttpError as e:
                 # Gmail API가 반환한 특정 오류 처리
                 if e.resp.status == 400: # 복구 불가능한 '불량 메일' 오류
                     reason = e._get_reason()
-                    logger.info(f"[{acc_id}] - 스킵(불량메일): {subject[:40]}... 이유: {reason}")
+                    logger.info(f"[{acc_id}] - 스킵(불량메일): {info} 이유: {reason}")
                     
                     try:
                         send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url)
@@ -546,28 +631,19 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                     raise
 
             # 3. 가져오기 성공 시 원본 서버에서 후처리 (success_action)
-            if success_action == "휴지통이동":
-                copy_status, _ = server.uid('COPY', uid, f'"{trash_folder}"')
-                if copy_status == 'OK':
-                    server.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
-                    server.expunge()
-                    logger.info(f"[{acc_id}] - 성공(휴지통 이동): {subject[:40]}")
-                else:
-                    # 복사 실패 시 읽음 처리로 대체
-                    server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
-                    logger.warning(f"[{acc_id}] - 성공(휴지통 복사 실패로 읽음 처리만 됨): {subject[:40]}")
-            elif success_action == "읽음처리":
-                server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
-                logger.info(f"[{acc_id}] - 성공(읽음 처리): {subject[:40]}")
+            apply_success_action(server, uid, acc_id, trash_folder, success_action, "성공", info)
                 
         except Exception as e:
             # FETCH, Import(HttpError 400 제외), success_action 등 모든 단계의 오류를 여기서 잡음
             # Broken pipe 같은 연결 오류도 여기에 해당됨
             # 오류 발생 시 상위로 예외를 전달하여 main 루프에서 프로그램을 종료하도록 함
-            logger.error(f"[{acc_id}] 메일(UID: {uid}) 처리 중 오류 발생. 상위로 전달: {e}")
+            mid = (email_msg.get('Message-ID') or '').strip() if email_msg is not None else ''
+            logger.error(f"[{acc_id}] 메일(UID: {uid}, Message-ID: {mid or '없음'}) 처리 중 오류 발생. 상위로 전달: {e}")
             raise # main()의 except 블록으로 예외를 전달
 
 def main():
+    global processed_ids
+    processed_ids = load_processed_ids()
     if not run_once:
         if str(AUTO_UPDATE).upper() == 'YES':
             check_and_update()
@@ -578,7 +654,7 @@ def main():
 
     while True:
         # 하루 1번, 새벽 4시가 되면 정기 업데이트 체크를 위해 프로그램 종료
-        # (세션 재연결 주기인 3분마다 한 번씩만 체크하여 자연스러운 분산 종료 효과 발생)
+        # (세션 재연결 주기인 2분마다 한 번씩만 체크하여 자연스러운 분산 종료 효과 발생)
         now = datetime.now()
         if now.hour == 4 and now.day != last_checked_day:
             logger.info("새벽 4시 정기 재시작(업데이트 체크용)을 위해 프로그램을 종료합니다.")
@@ -630,9 +706,9 @@ def main():
         while True:
             current_time = time.time()
             
-            # 3분(180초)이 경과했으면 안전하게 연결을 종료하고 재접속 (run_once 모드가 아닐 때)
-            if not run_once and (current_time - session_start_time) >= 180:
-                logger.info("세션 유지 시간(3분) 경과. 재접속합니다.")
+            # 세션 유지 시간이 경과했으면 안전하게 연결을 종료하고 재접속 (run_once 모드가 아닐 때)
+            if not run_once and (current_time - session_start_time) >= SESSION_SECONDS:
+                logger.info(f"세션 유지 시간({SESSION_SECONDS // 60}분) 경과. 재접속합니다.")
                 break
                 
             for conn in connections:
