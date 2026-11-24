@@ -17,6 +17,14 @@ try:
 except ImportError:
     AUTO_UPDATE = 'no'
 
+# [v1.9 업데이트 내역]
+# (2026-11-24)
+# 1. 강제 종료(서버 자동 재부팅 등)에 안전하도록 파일 저장 방식 보강.
+#   - 문제: 인증 토큰(token_*.json)을 open('w')로 바로 덮어써서, 파일이 비워진 직후 종료되면
+#           빈 토큰이 남는다 -> 이후 기동마다 실패, 서버에서는 재인증도 불가(브라우저 필요).
+#   - 조치: 토큰을 임시 파일에 쓰고 flush + fsync 후 os.replace 로 원자적 교체.
+#           processed_ids.json 저장에도 flush + fsync 추가(전원 차단·강제 리셋 대비).
+
 # [v1.8 업데이트 내역]
 # (2026-11-13)
 # 1. 보낸메일 동기화 추가 (계정별 선택 기능, 설정이 없으면 꺼짐 -> 기존 설정은 종전과 동일하게 동작).
@@ -158,7 +166,7 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.8"
+TO_GMAIL_VERSION="v1.9"
 COMMON_CREDENTIALS = "client_secret.json"
 # IMAP 소켓과 Gmail API(httplib2: build_http()가 socket.getdefaulttimeout()을 따름) 양쪽에 적용된다.
 TIMEOUT = 120
@@ -278,8 +286,13 @@ def get_gmail_service(token_filename):
         else:
             flow = InstalledAppFlow.from_client_secrets_file(COMMON_CREDENTIALS, scopes)
             creds = flow.run_local_server(port=0)
-        with open(token_path, 'w') as token:
+        # (v1.9) 임시 파일에 쓰고 원자적으로 교체한다. 바로 open('w')하면 비워진 직후 종료 시 빈 토큰이 남는다.
+        tmp_path = token_path + ".tmp"
+        with open(tmp_path, 'w') as token:
             token.write(creds.to_json())
+            token.flush()
+            os.fsync(token.fileno())
+        os.replace(tmp_path, token_path)
     
     return build('gmail', 'v1', credentials=creds, static_discovery=False)
 
@@ -581,6 +594,8 @@ def remember_processed_id(acc_id, message_id):
     try:
         with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(processed_ids, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())  # (v1.9) 전원 차단·강제 리셋 대비
         os.replace(temp_file, PROCESSED_IDS_FILE)
     except Exception as e:
         # 기록 실패로 이관 자체를 멈추지는 않는다(메모리 기록은 유지되어 이번 실행 동안은 유효).
