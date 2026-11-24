@@ -17,6 +17,29 @@ try:
 except ImportError:
     AUTO_UPDATE = 'no'
 
+# [v1.8 업데이트 내역]
+# (2026-11-13)
+# 1. 보낸메일 동기화 추가 (계정별 선택 기능, 설정이 없으면 꺼짐 -> 기존 설정은 종전과 동일하게 동작).
+#   - 배경: 2027-01 Gmail의 제3자 계정 'Send as'가 중단되어, 메일 발송을 원본 메일서버 웹메일에서 하게 된다.
+#           그러면 보낸메일이 Gmail에 저절로 남지 않으므로 원본 서버의 보낸메일함을 Gmail 보낸편지함으로 이관한다.
+#   - 설정: "send_success_action": "보낸편지함", "send_error_action": "에러편지함"  (값 = 원본 서버의 메일함 이름)
+#   - 흐름: 원본 보낸메일함(\Sent 플래그로 자동 탐색)의 메일 전체(삭제표시 제외)를 3통씩
+#           Gmail에 labelIds=['SENT']로 import(필터 적용) ->
+#           성공: 원본을 send_success_action 메일함으로 이동
+#           400 불량메일: Gmail에 '[Import Error][보낸메일]' 알림 발송 + send_error_action 메일함으로 이동
+#   - 보낸메일은 \Seen 여부가 제각각이라(실측) UNSEEN 검색을 쓸 수 없다. 처리한 메일을 다른 메일함으로
+#     옮기는 것으로 '처리 완료'를 구분한다.
+#   - 중복 방지: processed_ids.json 에 '계정id:sent' 키로 받은메일과 분리 기록한다.
+#     (받은메일·보낸메일 사본의 Message-ID가 같은 메일서버라도 서로 건너뛰지 않도록)
+#   - 접속 시 설정한 메일함이 실제로 있는지 확인하고, 없으면 그 계정의 보낸메일 동기화만 끈다(에러 로그).
+# 2. error_action 에 메일함 이름 지정 가능 (예: "에러편지함").
+#   - "읽음처리"/"휴지통이동" 외의 값은 원본 서버의 메일함 이름으로 보고 그 메일함으로 이동한다.
+#   - 메일함이 없으면 에러 로그 후 "읽음처리"로 대체한다(재시도·리포트 반복 방지). 이동 실패 시에도 읽음 처리.
+# 3. 한글 메일함 이름은 IMAP 수정 UTF-7로 변환해서 쓴다(예: 보낸편지함 -> &vPSwuNO4ycDVaA-).
+#    비즈메카는 MOVE 명령이 없어 COPY -> \Deleted -> EXPUNGE 로 이동한다(휴지통 이동과 같은 방식).
+# 4. 메일함 이동(보낸편지함/에러편지함) 시 읽음 처리 후 옮긴다 — 메일은 Gmail에서 읽으므로
+#    웹메일에 안읽음 표시가 남지 않게 한다. (기존 휴지통 이동 경로는 변경 없음)
+
 # [v1.7 업데이트 내역]
 # (2026-09-17)
 # 1. 같은 메일이 Gmail에 여러 번 이관되던 문제 대응 — 처리 완료 Message-ID 로컬 기록.
@@ -135,7 +158,7 @@ except ImportError:
 #   - (이전) imap 메일 읽기 => 휴지통 이동 => 지메일 import
 #   - (개선) imap 메일 읽기 => 지메일 import => 휴지통 이동
 
-TO_GMAIL_VERSION="v1.7"
+TO_GMAIL_VERSION="v1.8"
 COMMON_CREDENTIALS = "client_secret.json"
 # IMAP 소켓과 Gmail API(httplib2: build_http()가 socket.getdefaulttimeout()을 따름) 양쪽에 적용된다.
 TIMEOUT = 120
@@ -398,15 +421,83 @@ def get_trash_folder(server):
         pass
     return "Trash"
 
+# 기존 error_action 값. 이 외의 값은 원본 서버의 메일함 이름으로 본다(v1.8).
+BUILTIN_ACTIONS = ("읽음처리", "휴지통이동")
+
+def imap_utf7_encode(name):
+    """메일함 이름을 IMAP 수정 UTF-7(RFC 3501 5.1.3)로 변환한다. 예: '보낸편지함' -> '&vPSwuNO4ycDVaA-'.
+    ASCII 출력 문자는 그대로('&'만 '&-'), 그 외는 UTF-16BE를 base64(','로 '/' 대체, 패딩 없음)로 감싼다."""
+    out, buf = [], ""
+    def flush():
+        b64 = base64.b64encode(buf.encode('utf-16-be')).decode().rstrip('=').replace('/', ',')
+        out.append('&' + b64 + '-')
+    for ch in name:
+        if 0x20 <= ord(ch) <= 0x7e:
+            if buf:
+                flush(); buf = ""
+            out.append('&-' if ch == '&' else ch)
+        else:
+            buf += ch
+    if buf:
+        flush()
+    return "".join(out)
+
+def list_folders(server):
+    """[(플래그 문자열, 서버상 메일함 이름), ...]. 이름은 서버 표기(수정 UTF-7) 그대로."""
+    result = []
+    status, response = server.list()
+    if status != 'OK':
+        return result
+    for line in response:
+        if not line: continue
+        line_str = line.decode('ascii', errors='ignore') if isinstance(line, bytes) else str(line)
+        match = re.search(r'("[^"]+"|\S+)$', line_str.strip())
+        if match:
+            result.append((line_str, match.group(1).strip('"')))
+    return result
+
+def get_sent_folder(folders):
+    """보낸메일함 이름. \\Sent 플래그 우선, 없으면 흔한 이름으로 유추, 그래도 없으면 None."""
+    for flags, name in folders:
+        if '\\Sent' in flags:
+            return name
+    for flags, name in folders:
+        if name.lower() in ('sent', 'sent messages', 'sent items', 'sent mail'):
+            return name
+    return None
+
+def find_folder(folders, display_name):
+    """설정에 적은 메일함 이름(한글 가능)을 서버상 이름으로 찾는다. 없으면 None."""
+    encoded = imap_utf7_encode(display_name)
+    for _, name in folders:
+        if name == encoded or name == display_name:
+            return name
+    return None
+
+def move_to_folder(server, uid, folder):
+    """현재 선택된 메일함의 uid를 folder(서버상 이름)로 옮긴다. \\Seen -> COPY -> \\Deleted -> EXPUNGE.
+    (비즈메카는 MOVE 미지원) 메일은 Gmail에서 읽으므로 옮긴 사본은 읽음 상태로 둔다
+    (COPY는 플래그를 그대로 가져가므로 복사 전에 원본을 읽음 처리).
+    COPY 실패 시 원본은 읽음 표시만 남고 False."""
+    server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+    copy_status, _ = server.uid('COPY', uid, f'"{folder}"')
+    if copy_status != 'OK':
+        return False
+    server.uid('STORE', uid, '+FLAGS', '(\\Deleted)')
+    server.expunge()
+    return True
+
 def get_webmail_url(imap_host):
     """계정 IMAP 호스트에 맞는 웹메일 URL. 등록되지 않은 호스트면 None(버튼을 붙이지 않는다)."""
     return WEBMAIL_URLS.get((imap_host or "").strip().lower())
 
-def send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url=None):
+def send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url=None,
+                      title_prefix="[Import Error]"):
     """에러 발생 시 클릭 가능한 링크가 포함된 HTML 리포트 발송
 
     webmail_url이 None이면 '웹메일 바로가기' 버튼을 넣지 않는다.
     (WEBMAIL_URLS에 등록되지 않은 메일 서버. 아무 링크나 붙이면 엉뚱한 곳으로 보내게 된다)
+    title_prefix: 받은메일은 기본값, 보낸메일은 '[Import Error][보낸메일]'(v1.8).
     """
     
     # 전달받은 subject, sender는 메일 추출 시 1차 디코딩되지만, 안전을 위해 한 번 더 처리
@@ -421,7 +512,7 @@ def send_error_report(service, my_email, uid, subject, sender, reason, acc_id, w
     # 메일 객체 생성 (HTML을 지원하기 위해 MIMEMultipart 사용)
     msg = MIMEMultipart('alternative')
     # 지메일 목록에서도 한글로 보이도록 제목도 인코딩하여 설정
-    msg['Subject'] = Header(f"[Import Error] {pretty_subject}", 'utf-8').encode()
+    msg['Subject'] = Header(f"{title_prefix} {pretty_subject}", 'utf-8').encode()
     msg['To'] = my_email
     msg['From'] = my_email
 
@@ -512,8 +603,10 @@ def apply_success_action(server, uid, acc_id, trash_folder, success_action, labe
         server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
         logger.info(f"[{acc_id}] - {label}(읽음 처리): {info}")
 
-def process_unread(server, service, acc_id, my_email, trash_folder, success_action, error_action, webmail_url=None):
-    """INBOX에서 읽지 않은 메일을 검색하여 처리합니다."""
+def process_unread(server, service, acc_id, my_email, trash_folder, success_action, error_action, webmail_url=None,
+                   error_folder=None):
+    """INBOX에서 읽지 않은 메일을 검색하여 처리합니다.
+    error_folder: error_action이 메일함 이름일 때 그 서버상 이름(v1.8). main()에서 확인 후 넘긴다."""
     try:
         server.select("INBOX")
         status, messages = server.uid('SEARCH', 'UNSEEN')
@@ -623,7 +716,14 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
                             # cron 1분 주기로 import 재실패 + 에러 리포트 재발송이 무한 반복된다.
                             server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
                             logger.warning(f"[{acc_id}] - 불량 메일 휴지통 복사 실패로 읽음 처리만 됨.")
-                    
+                    elif error_folder:
+                        # (v1.8) 메일함 이름 지정(예: 에러편지함). 이동 실패 시 위와 같은 이유로 읽음 처리.
+                        if move_to_folder(server, uid, error_folder):
+                            logger.info(f"[{acc_id}] - 불량 메일 '{error_action}' 이동 완료.")
+                        else:
+                            server.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+                            logger.warning(f"[{acc_id}] - 불량 메일 '{error_action}' 복사 실패로 읽음 처리만 됨.")
+
                     continue # 다음 메일로 넘어감
                 else:
                     # 400 외 다른 HTTP 오류(5xx 등)는 일시적일 수 있으므로,
@@ -640,6 +740,142 @@ def process_unread(server, service, acc_id, my_email, trash_folder, success_acti
             mid = (email_msg.get('Message-ID') or '').strip() if email_msg is not None else ''
             logger.error(f"[{acc_id}] 메일(UID: {uid}, Message-ID: {mid or '없음'}) 처리 중 오류 발생. 상위로 전달: {e}")
             raise # main()의 except 블록으로 예외를 전달
+
+def process_sent(server, service, acc_id, my_email, sent, webmail_url=None):
+    """(v1.8) 원본 서버 보낸메일함의 메일을 Gmail 보낸편지함(SENT)으로 이관한다.
+    sent: main()이 확인한 {"folder", "success_folder", "success_name", "error_folder", "error_name"}.
+    처리한 메일은 보낸메일함에서 다른 메일함으로 옮겨지므로, 보낸메일함에 남은 메일 = 미처리 메일이다."""
+    record_key = f"{acc_id}:sent"   # 받은메일 기록과 분리
+    try:
+        server.select(f'"{sent["folder"]}"')
+        status, messages = server.uid('SEARCH', 'UNDELETED')
+    except Exception as e:
+        logger.error(f"[{acc_id}] 보낸메일함 SEARCH 실패: {e}")
+        raise
+
+    if status != 'OK' or not messages[0]:
+        return
+
+    for uid_bytes in messages[0].split()[:3]:
+        uid = uid_bytes.decode()
+        if (acc_id, uid) in sent_move_failed:
+            continue   # 이번 실행에서 이동 실패한 메일은 재처리하지 않는다(리포트·import 반복 방지)
+        email_msg = None
+        try:
+            status, msg_data = server.uid('FETCH', uid, '(BODY.PEEK[])')
+            if status != 'OK':
+                logger.warning(f"[{acc_id}] 보낸메일 UID {uid} FETCH 실패, 건너뜁니다.")
+                continue
+            raw_content = None
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    raw_content = response_part[1]
+            if not raw_content:
+                logger.warning(f"[{acc_id}] 보낸메일 UID {uid} 내용이 비어있어 건너뜁니다.")
+                continue
+
+            email_msg = message_from_bytes(raw_content)
+            raw_subject = email_msg.get('Subject', '')
+            decoded_subject = _decode_mime_header_raw(raw_subject)
+            subject = _unescape_numeric_entities(decoded_subject)
+            sender = decode_mime_header(email_msg.get('From', ''))
+            message_id = (email_msg.get('Message-ID') or '').strip()
+            info = f"{subject[:40]} (보낸메일 UID: {uid}, Message-ID: {message_id or '없음'})"
+
+            def move(folder, name, label):
+                if move_to_folder(server, uid, folder):
+                    logger.info(f"[{acc_id}] - {label}('{name}' 이동): {info}")
+                else:
+                    # 보낸메일은 읽음 처리로 대체할 수 없다(검색 기준이 아님). 이번 실행 동안은 건너뛴다.
+                    sent_move_failed.add((acc_id, uid))
+                    logger.warning(f"[{acc_id}] - {label}('{name}' 복사 실패, 보낸메일함에 남김): {info}")
+
+            # 이미 이관한 메일(이전에 import 후 이동만 실패한 경우 등)은 이동만 한다.
+            if message_id and message_id in processed_ids.get(record_key, []):
+                move(sent["success_folder"], sent["success_name"], "보낸메일 중복 스킵(이미 이관됨)")
+                continue
+
+            if DUMP_MAIL_CONTENT:
+                log_mail_content(acc_id, uid, email_msg, raw_subject, subject, email_msg.get('From', ''), sender)
+
+            if subject_needs_rewrite(raw_subject, decoded_subject) and 'Subject' in email_msg:
+                email_msg.replace_header('Subject', Header(subject, 'utf-8').encode())
+                modified_raw_content = message_to_crlf_bytes(email_msg)
+            else:
+                modified_raw_content = raw_content
+
+            try:
+                request = service.users().messages().import_(
+                    userId='me',
+                    internalDateSource='dateHeader',
+                    neverMarkSpam=True,
+                    body={'raw': base64.urlsafe_b64encode(modified_raw_content).decode(), 'labelIds': ['SENT']}
+                )
+                request.uri += '&processForFilters=true'
+                request.execute()
+                if message_id:
+                    remember_processed_id(record_key, message_id)
+            except HttpError as e:
+                if e.resp.status == 400:
+                    reason = e._get_reason()
+                    logger.info(f"[{acc_id}] - 보낸메일 스킵(불량메일): {info} 이유: {reason}")
+                    try:
+                        send_error_report(service, my_email, uid, subject, sender, reason, acc_id, webmail_url,
+                                          title_prefix="[Import Error][보낸메일]")
+                    except Exception as report_err:
+                        logger.error(f"[{acc_id}]   [!] 에러 리포트 발송 실패: {report_err}")
+                    move(sent["error_folder"], sent["error_name"], "보낸메일 불량")
+                    continue
+                raise
+
+            move(sent["success_folder"], sent["success_name"], "보낸메일 성공")
+
+        except Exception as e:
+            mid = (email_msg.get('Message-ID') or '').strip() if email_msg is not None else ''
+            logger.error(f"[{acc_id}] 보낸메일(UID: {uid}, Message-ID: {mid or '없음'}) 처리 중 오류 발생. 상위로 전달: {e}")
+            raise
+
+# 이번 실행 동안 메일함 이동(COPY)에 실패한 보낸메일 {(acc_id, uid)}. 재시작하면 다시 시도한다.
+sent_move_failed = set()
+
+def setup_folders(server, config, acc_id):
+    """(v1.8) 계정 설정의 메일함 이름을 확인한다. -> (error_action, error_folder, sent)
+    - error_action이 메일함 이름인데 없으면 '읽음처리'로 대체.
+    - send_success_action이 없으면 sent=None(보낸메일 동기화 꺼짐 — 기존 설정과 동일).
+      보낸메일함·대상 메일함 중 하나라도 없으면 에러 로그 후 그 계정만 끈다."""
+    error_action = config.get("error_action", "읽음처리")
+    send_success = config.get("send_success_action")
+    send_error = config.get("send_error_action")
+    if error_action in BUILTIN_ACTIONS and not send_success and not send_error:
+        return error_action, None, None   # 기존 설정: LIST 조회도 하지 않는다
+
+    folders = list_folders(server)
+    error_folder = None
+    if error_action not in BUILTIN_ACTIONS:
+        error_folder = find_folder(folders, error_action)
+        if not error_folder:
+            logger.error(f"[{acc_id}] error_action 메일함 '{error_action}'이(가) 서버에 없어 '읽음처리'로 대체합니다.")
+            error_action = "읽음처리"
+
+    sent = None
+    if send_success or send_error:
+        sent_folder = get_sent_folder(folders)
+        success_folder = find_folder(folders, send_success) if send_success else None
+        err_folder = find_folder(folders, send_error) if send_error else None
+        problems = []
+        if not sent_folder: problems.append("보낸메일함(\\Sent)을 찾지 못함")
+        if not success_folder:
+            problems.append(f"send_success_action 메일함 '{send_success}' 없음" if send_success else "send_success_action 설정 없음")
+        if not err_folder:
+            problems.append(f"send_error_action 메일함 '{send_error}' 없음" if send_error else "send_error_action 설정 없음")
+        if problems:
+            logger.error(f"[{acc_id}] 보낸메일 동기화를 끕니다: {', '.join(problems)}")
+        else:
+            sent = {"folder": sent_folder,
+                    "success_folder": success_folder, "success_name": send_success,
+                    "error_folder": err_folder, "error_name": send_error}
+            logger.info(f"[{acc_id}] 보낸메일 동기화 켜짐.")   # 2분마다 재접속 시 찍히므로 짧게
+    return error_action, error_folder, sent
 
 def main():
     global processed_ids
@@ -678,6 +914,7 @@ def main():
                 server = imaplib.IMAP4_SSL(config["imap"]["host"])
                 server.login(config["imap"]["user"], config["imap"]["pass"])
                 trash_folder = get_trash_folder(server)
+                error_action, error_folder, sent = setup_folders(server, config, acc_id)
                 server.select("INBOX")
                 
                 service = get_gmail_service(token_file)
@@ -694,7 +931,10 @@ def main():
                     "webmail_url": get_webmail_url(config["imap"]["host"]),
                     "polling_time": config.get("polling_time", 60),
                     "success_action": config.get("success_action", "휴지통이동"),
-                    "error_action": config.get("error_action", "읽음처리"),
+                    "error_action": error_action,
+                    "error_folder": error_folder,   # error_action이 메일함 이름일 때(v1.8)
+                    "sent": sent,                   # 보낸메일 동기화 설정(v1.8). None이면 꺼짐
+
                     "next_check": time.time() # 시작하자마자 첫 검사를 위해 현재 시간 기록
                 })
                 logger.info(f"[{acc_id}] 연결 완료.")
@@ -723,8 +963,18 @@ def main():
                             conn["trash_folder"],
                             conn["success_action"],
                             conn["error_action"],
-                            conn["webmail_url"]
+                            conn["webmail_url"],
+                            conn["error_folder"]
                         )
+                        if conn["sent"]:
+                            process_sent(
+                                conn["server"],
+                                conn["service"],
+                                conn["acc_id"],
+                                conn["my_email"],
+                                conn["sent"],
+                                conn["webmail_url"]
+                            )
                     except Exception as e:
                         logger.error(f"[{conn['acc_id']}] 처리 중 치명적 오류 발생: {e}")
                         os._exit(1)
